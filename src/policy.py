@@ -29,6 +29,10 @@ class GaussianPolicy(nn.Module):
 class CriticNet(nn.Module):
     @nn.compact
     def __call__(self, x):
+        x = nn.Dense(100, name="dense1")(x)
+        x = nn.tanh(x)
+        x = nn.Dense(50, name="dense2")(x)
+        x = nn.tanh(x)
         x = nn.Dense(1, name="out")(x)
         return x
     

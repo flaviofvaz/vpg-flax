@@ -66,6 +66,10 @@ class Buffer:
         self.ptr = 0
         self.trajectory_start_idx = 0
 
+        adv_mean = self.advantage_buffer.mean()
+        adv_std = self.advantage_buffer.std()
+        self.advantage_buffer = (self.advantage_buffer - adv_mean) / adv_std
+
         return jnp.asarray(self.observation_buffer), jnp.asarray(self.action_buffer), jnp.asarray(self.rewards_to_go), jnp.asarray(self.advantage_buffer)
 
 
@@ -101,7 +105,6 @@ def collect_trajectories(buffer, env, actor_state, critic_state, num_steps, max_
     ep_len = 0
     ep_reward = 0
     ep_rewards = []
-    d = 1.0
     for t in range(num_steps):
         obs = np.concatenate([time_step.observation["position"], time_step.observation["velocity"]])
         action, v, random_key = get_action(obs, actor_state, critic_state, random_key)
@@ -110,8 +113,7 @@ def collect_trajectories(buffer, env, actor_state, critic_state, num_steps, max_
         buffer.store(obs, action, next_time_step.reward, v.item())
 
         ep_len += 1
-        ep_reward += d * next_time_step.reward
-        d = d * 0.99
+        ep_reward += next_time_step.reward
 
         time_step = next_time_step
 
@@ -119,13 +121,20 @@ def collect_trajectories(buffer, env, actor_state, critic_state, num_steps, max_
         truncate = ep_len == max_len
         last_step = t == num_steps - 1
         if terminal or truncate or last_step:
-            buffer.end_of_trajectory(0)
+
+            if (truncate or last_step) and not terminal:
+                # bootstrap v
+                obs = np.concatenate([time_step.observation["position"], time_step.observation["velocity"]])
+                action, v, random_key = get_action(obs, actor_state, critic_state, random_key)
+                buffer.end_of_trajectory(v.item())
+            else:
+                buffer.end_of_trajectory(0)
+
             time_step = env.reset()
 
             ep_rewards.append(ep_reward)
             ep_reward = 0
             ep_len = 0
-            d = 1.0
     
     return buffer, random_key, ep_rewards
 
@@ -160,8 +169,8 @@ def main():
     actor_params = actor.init(actor_init_key, jnp.ones([1, obs_dim]))["params"]
     critic_params = critic.init(critic_init_key, jnp.ones([1, obs_dim]))["params"]
 
-    actor_opt = optax.sgd(learning_rate=learning_rate_policy)
-    critic_opt = optax.sgd(learning_rate=learning_rate_v)
+    actor_opt = optax.adam(learning_rate=learning_rate_policy)
+    critic_opt = optax.adam(learning_rate=learning_rate_v)
 
     actor_state = train_state.TrainState.create(apply_fn=actor.apply, params=actor_params, tx=actor_opt)
     critic_state = train_state.TrainState.create(apply_fn=critic.apply, params=critic_params, tx=critic_opt)
