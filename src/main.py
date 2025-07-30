@@ -1,31 +1,36 @@
-import flax.nnx
 from environments.control import load_environment as load_control_enviroment
 import numpy as np
-from policy import GaussianPolicy, Baseline
+from policy import GaussianPolicy, CriticNet
 import jax
 import jax.numpy as jnp
-import flax
+from flax.training import train_state
 import numpy as np
 import json
-from flax import nnx
 import optax
 import time
+from scipy.signal import lfilter
+from functools import partial
 
 
 # for cpu development
 jax.config.update("jax_platforms", "cpu")
 
 
+def discount_cumsum(arr, discount):
+    return lfilter([1], [1, float(-discount)], arr[::-1], axis=0)[::-1]
+
+
 class Buffer:
     def __init__(self, obs_dim, act_dim, size, gamma, lam):
-        self.observation_buffer = jnp.zeros(self.get_shape(size, obs_dim), dtype=jnp.float32)
-        self.action_buffer = jnp.zeros(self.get_shape(size, act_dim), dtype=jnp.float32)
-        self.reward_buffer = jnp.zeros(size, dtype=jnp.float32)
-        self.rewards_to_go = jnp.zeros(size, dtype=jnp.float32)
-        self.state_value_buffer = jnp.zeros(size, dtype=jnp.float32)
+        self.observation_buffer = np.zeros(self.get_shape(size, obs_dim), dtype=np.float32)
+        self.action_buffer = np.zeros(self.get_shape(size, act_dim), dtype=np.float32)
+        self.advantage_buffer = np.zeros(size, dtype=np.float32) 
+        self.reward_buffer = np.zeros(size, dtype=np.float32)
+        self.rewards_to_go = np.zeros(size, dtype=np.float32)
+        self.state_value_buffer = np.zeros(size, dtype=np.float32)
 
         self.gamma = gamma
-        # self.lam = lam
+        self.lamba = lam
         self.ptr = 0
         self.trajectory_start_idx = 0
         self.max_size = size
@@ -36,28 +41,24 @@ class Buffer:
     def store(self, observation, action, reward, state_value):
         assert self.ptr < self.max_size
 
-        self.observation_buffer = self.observation_buffer.at[self.ptr].set(observation)
-        self.action_buffer = self.action_buffer.at[self.ptr].set(action)
-        self.reward_buffer = self.reward_buffer.at[self.ptr].set(reward)
-        self.state_value_buffer = self.state_value_buffer.at[self.ptr].set(state_value)
+        self.observation_buffer[self.ptr] = observation
+        self.action_buffer[self.ptr] = action
+        self.reward_buffer[self.ptr] = reward
+        self.state_value_buffer[self.ptr] = state_value
         self.ptr += 1
 
     def end_of_trajectory(self, last_val=0.0):
         trajectory_slice = slice(self.trajectory_start_idx, self.ptr)
+        rews = np.append(self.reward_buffer[trajectory_slice], last_val)
+        vals = np.append(self.state_value_buffer[trajectory_slice], last_val)
 
-        rewards = jnp.append(self.reward_buffer[trajectory_slice], last_val)
-        rewards_reversed = rewards[::-1]
+        # GAE-Lambda Advantage
+        deltas = rews[:-1] + self.gamma * vals[1:] - vals[:-1]
+        self.advantage_buffer[trajectory_slice] = discount_cumsum(deltas, self.gamma * self.lamba)
 
-        discount_factors = self.gamma ** jnp.arange(len(rewards))
-        discounted_rewards = rewards_reversed / discount_factors
-        cumsum = jnp.cumsum(discounted_rewards)
+        # rewards to go
+        self.rewards_to_go[trajectory_slice] = discount_cumsum(rews, self.gamma)[:-1]
 
-        rew_to_go = cumsum * discount_factors
-
-        # reverse
-        rew_to_go = rew_to_go[::-1]
-
-        self.rewards_to_go = self.rewards_to_go.at[trajectory_slice].set(rew_to_go[:-1])
         self.trajectory_start_idx = self.ptr
 
     def get(self):
@@ -65,47 +66,52 @@ class Buffer:
         self.ptr = 0
         self.trajectory_start_idx = 0
 
-        return self.observation_buffer, self.action_buffer, self.rewards_to_go, self.state_value_buffer
+        return jnp.asarray(self.observation_buffer), jnp.asarray(self.action_buffer), jnp.asarray(self.rewards_to_go), jnp.asarray(self.advantage_buffer)
 
 
-def compute_loss(policy, observations, actions, rewards, v):
-    dist = policy(jnp.asarray(observations))
-    logp = dist.log_prob(jnp.asarray(actions))
+def compute_actor_loss(actor_params, observations: jax.Array, actions: jax.Array, advantage: jax.Array, apply_fn):
+    dist = apply_fn({"params": actor_params}, observations)
+    logp = dist.log_prob(actions)
 
-    weights = rewards - v
-    return (-logp * weights).mean()
+    return (-logp * advantage).mean()
 
 
-def compute_v_loss(baseline, observations, rewards):
-    mse = (baseline(observations) - rewards) ** 2
+def compute_v_loss(critic_params, observations, rewards_to_go, apply_fn):
+    mse = (apply_fn({"params": critic_params},  observations) - rewards_to_go) ** 2
     return mse.mean()
 
 
-@nnx.jit
-def get_action(obs, policy, baseline, key):
-    dist = policy(obs)
+@jax.jit
+def get_action(obs: jax.Array, actor_state: train_state.TrainState, critic_state: train_state.TrainState, key: jax.random.PRNGKey):
+    # actor forward apass
+    dist = actor_state.apply_fn({"params": actor_state.params}, obs)
+    
+    # sample action according to distribution
     key, subkey = jax.random.split(key)
     action = dist.sample(seed=subkey)
 
-    v = baseline(obs)
+    # critic forward pass
+    v = critic_state.apply_fn({"params": critic_state.params}, obs)
     return action, v, key
 
 
-def collect_trajectories(buffer: Buffer, env, policy, baseline, num_steps, max_len, random_key):
+def collect_trajectories(buffer, env, actor_state, critic_state, num_steps, max_len, random_key):
     time_step = env.reset()
 
     ep_len = 0
     ep_reward = 0
     ep_rewards = []
+    d = 1.0
     for t in range(num_steps):
         obs = np.concatenate([time_step.observation["position"], time_step.observation["velocity"]])
-        action, v, random_key = get_action(obs, policy, baseline, random_key)
+        action, v, random_key = get_action(obs, actor_state, critic_state, random_key)
 
         next_time_step = env.step(action)
         buffer.store(obs, action, next_time_step.reward, v.item())
 
         ep_len += 1
-        ep_reward += next_time_step.reward
+        ep_reward += d * next_time_step.reward
+        d = d * 0.99
 
         time_step = next_time_step
 
@@ -119,6 +125,7 @@ def collect_trajectories(buffer: Buffer, env, policy, baseline, num_steps, max_l
             ep_rewards.append(ep_reward)
             ep_reward = 0
             ep_len = 0
+            d = 1.0
     
     return buffer, random_key, ep_rewards
 
@@ -144,20 +151,30 @@ def main():
     obs_dim = sum([arr.shape[0] for arr in observation_spec.values()])
     buffer = Buffer(obs_dim, action_spec.shape, buffer_max_size, gamma, lam)
 
-    random_key = jax.random.PRNGKey(seed=seed) 
-    random_key, random_subkey_policy, random_subkey_baseline = jax.random.split(random_key, 3)
-    policy = GaussianPolicy(obs_dim=obs_dim, action_dim=action_spec.shape[0], rngs=flax.nnx.Rngs(params=random_subkey_policy))
-    baseline = Baseline(obs_dim=obs_dim, out_dim=1, rngs=flax.nnx.Rngs(params=random_subkey_baseline))
+    rand_key = jax.random.PRNGKey(seed=seed) 
+    rand_key, actor_init_key, critic_init_key = jax.random.split(rand_key, 3)
 
-    tx_actor = optax.sgd(learning_rate=learning_rate_policy)
-    tx_critic = optax.sgd(learning_rate=learning_rate_v)
-    optimizer_actor = nnx.Optimizer(model=policy, tx=tx_actor)
-    optimizer_critic = nnx.Optimizer(model=baseline, tx=tx_critic)
+    actor = GaussianPolicy()
+    critic = CriticNet()
+
+    actor_params = actor.init(actor_init_key, jnp.ones([1, obs_dim]))["params"]
+    critic_params = critic.init(critic_init_key, jnp.ones([1, obs_dim]))["params"]
+
+    actor_opt = optax.sgd(learning_rate=learning_rate_policy)
+    critic_opt = optax.sgd(learning_rate=learning_rate_v)
+
+    actor_state = train_state.TrainState.create(apply_fn=actor.apply, params=actor_params, tx=actor_opt)
+    critic_state = train_state.TrainState.create(apply_fn=critic.apply, params=critic_params, tx=critic_opt)
+
+    train_step = create_train_step(
+        actor_apply_fn=actor_state.apply_fn, 
+        critic_apply_fn=critic_state.apply_fn
+    )
 
     training_start_time = time.time()
     for i in range(num_iterations):
         start_time = time.time()
-        buffer, random_key, ep_rewards = collect_trajectories(buffer, env, policy, baseline, steps_per_iteration, max_trajectory_size, random_key)
+        buffer, rand_key, ep_rewards = collect_trajectories(buffer, env, actor_state, critic_state, steps_per_iteration, max_trajectory_size, rand_key)
 
         avg_rewards = sum(ep_rewards) / len(ep_rewards)
         collection_time = time.time() - start_time
@@ -165,44 +182,37 @@ def main():
         start_time = time.time()
         obs, act, rew, v  = buffer.get()
 
-        graphdef_policy, state_policy = nnx.split((policy, optimizer_actor))
-        graphdef_critic, state_critic = nnx.split((baseline, optimizer_critic))
+        actor_state, critic_state = train_step(actor_state, critic_state, obs, act, rew, v)
 
-        state_policy, state_critic = train_step(obs, act, rew, v, graphdef_policy, state_policy, graphdef_critic, state_critic)
-
-        nnx.update((policy, optimizer_actor), state_policy)
-        nnx.update((baseline, optimizer_critic), state_critic)
         train_time = time.time() - start_time
-
         data = {"iteration": i, "collection_time": f"{collection_time:.2f}", "training:time": f"{train_time:.2f}", "avg_reward": f"{avg_rewards:.2f}"}
         print(json.dumps(data))
     print(f"Training done. Total training time: {(time.time() - training_start_time) // 60} minutes")
 
 
-@jax.jit
-def train_step(obs, act, rew, v, graphdef_policy, state_policy, graphdef_critic, state_critic):
-    policy, optimizer_actor = nnx.merge(graphdef_policy, state_policy)
-
-    grad_fn_policy = nnx.value_and_grad(compute_loss)
-    grad_fn_v = nnx.value_and_grad(compute_v_loss)
-    _, grads = grad_fn_policy(policy, obs, act, rew, v)
-    optimizer_actor.update(grads)
-
-    state_policy = nnx.state((policy, optimizer_actor))
-
-    def critic_update(i, carry):
-        graphdef_critic, state_critic = carry
-        critic, critic_opt = nnx.merge(graphdef_critic, state_critic)
-        _, critic_grads = grad_fn_v(critic, obs, rew)
-        critic_opt.update(critic_grads)
-        state_critic = nnx.state((critic, critic_opt))
-        return graphdef_critic, state_critic
+def create_train_step(actor_apply_fn, critic_apply_fn):
+    actor_loss_fn = partial(compute_actor_loss, apply_fn=actor_apply_fn)
+    actor_grad_fn = jax.value_and_grad(actor_loss_fn, allow_int=True)
     
-    init_carry = (graphdef_critic, state_critic)
-    graphdef_critic, state_critic = jax.lax.fori_loop(
-        0, 80, critic_update, init_carry
-    )
-    return state_policy, state_critic
+    critic_loss_fn = partial(compute_v_loss, apply_fn=critic_apply_fn)
+    critic_grad_fn = jax.value_and_grad(critic_loss_fn)
+
+    @jax.jit
+    def train_step(actor_state, critic_state, obs, act, rew, adv):
+        _, actor_grads = actor_grad_fn(actor_state.params, obs, act, adv)
+        actor_state = actor_state.apply_gradients(grads=actor_grads)
+
+        def critic_update(i, state):
+            _, critic_grads = critic_grad_fn(state.params, obs, rew)
+            state = state.apply_gradients(grads=critic_grads)
+            return state
+
+        critic_state = jax.lax.fori_loop(
+            0, 80, critic_update, critic_state
+        )
+        return actor_state, critic_state 
+    
+    return train_step
 
 
 if __name__ == "__main__":
