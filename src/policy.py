@@ -34,6 +34,8 @@ class CriticNet(nn.Module):
         x = nn.tanh(x)
         x = nn.Dense(50, name="dense2")(x)
         x = nn.tanh(x)
+        x = nn.Dense(25, name="dense3")(x)
+        x = nn.tanh(x)
         x = nn.Dense(1, name="out")(x)
         return x.squeeze()
     
