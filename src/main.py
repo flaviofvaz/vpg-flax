@@ -85,21 +85,50 @@ def compute_v_loss(critic_params, observations, rewards_to_go, apply_fn):
     return mse.mean()
 
 
-@jax.jit
-def get_action(obs: jax.Array, actor_state: train_state.TrainState, critic_state: train_state.TrainState, key: jax.random.PRNGKey):
-    # actor forward apass
-    dist = actor_state.apply_fn({"params": actor_state.params}, obs)
+def create_get_action(actor_apply_fn, critic_apply_fn):
+    @jax.jit
+    def get_action(obs: jax.Array, actor_state: train_state.TrainState, critic_state: train_state.TrainState, key: jax.random.PRNGKey):
+        # actor forward apass
+        dist = actor_apply_fn({"params": actor_state.params}, obs)
+        
+        # sample action according to distribution
+        key, subkey = jax.random.split(key)
+        action = dist.sample(seed=subkey)
+
+        # critic forward pass
+        v = critic_apply_fn({"params": critic_state.params}, obs)
+        return action, v, key
+
+    return get_action
+
+
+def create_train_step(actor_apply_fn, critic_apply_fn):
+    actor_loss_fn = partial(compute_actor_loss, apply_fn=actor_apply_fn)
+    actor_grad_fn = jax.value_and_grad(actor_loss_fn, allow_int=True)
     
-    # sample action according to distribution
-    key, subkey = jax.random.split(key)
-    action = dist.sample(seed=subkey)
+    critic_loss_fn = partial(compute_v_loss, apply_fn=critic_apply_fn)
+    critic_grad_fn = jax.value_and_grad(critic_loss_fn)
 
-    # critic forward pass
-    v = critic_state.apply_fn({"params": critic_state.params}, obs)
-    return action, v, key
+    @jax.jit
+    def train_step(actor_state, critic_state, obs, act, rew, adv):
+        _, actor_grads = actor_grad_fn(actor_state.params, obs, act, adv)
+        actor_state = actor_state.apply_gradients(grads=actor_grads)
+
+        def critic_update(i, state):
+            _, critic_grads = critic_grad_fn(state.params, obs, rew)
+            state = state.apply_gradients(grads=critic_grads)
+            return state
+
+        critic_state = jax.lax.fori_loop(
+            0, 80, critic_update, critic_state
+        )
+        return actor_state, critic_state 
+    
+    return train_step
 
 
-def collect_trajectories(buffer, env, actor_state, critic_state, num_steps, max_len, random_key):
+
+def collect_trajectories(buffer, env, actor_state, critic_state, num_steps, max_len, random_key, get_action):
     time_step = env.reset()
 
     ep_len = 0
@@ -110,7 +139,7 @@ def collect_trajectories(buffer, env, actor_state, critic_state, num_steps, max_
         action, v, random_key = get_action(obs, actor_state, critic_state, random_key)
 
         next_time_step = env.step(action)
-        buffer.store(obs, action, next_time_step.reward, v.item())
+        buffer.store(obs, action, next_time_step.reward, v)
 
         ep_len += 1
         ep_reward += next_time_step.reward
@@ -126,7 +155,7 @@ def collect_trajectories(buffer, env, actor_state, critic_state, num_steps, max_
                 # bootstrap v
                 obs = np.concatenate([time_step.observation["position"], time_step.observation["velocity"]])
                 action, v, random_key = get_action(obs, actor_state, critic_state, random_key)
-                buffer.end_of_trajectory(v.item())
+                buffer.end_of_trajectory(v)
             else:
                 buffer.end_of_trajectory(0)
 
@@ -180,10 +209,15 @@ def main():
         critic_apply_fn=critic_state.apply_fn
     )
 
+    get_action = create_get_action(
+        actor_apply_fn=actor_state.apply_fn, 
+        critic_apply_fn=critic_state.apply_fn
+    )
+
     training_start_time = time.time()
     for i in range(num_iterations):
         start_time = time.time()
-        buffer, rand_key, ep_rewards = collect_trajectories(buffer, env, actor_state, critic_state, steps_per_iteration, max_trajectory_size, rand_key)
+        buffer, rand_key, ep_rewards = collect_trajectories(buffer, env, actor_state, critic_state, steps_per_iteration, max_trajectory_size, rand_key, get_action)
 
         avg_rewards = sum(ep_rewards) / len(ep_rewards)
         collection_time = time.time() - start_time
@@ -197,31 +231,6 @@ def main():
         data = {"iteration": i, "collection_time": f"{collection_time:.2f}", "training:time": f"{train_time:.2f}", "avg_reward": f"{avg_rewards:.2f}"}
         print(json.dumps(data))
     print(f"Training done. Total training time: {(time.time() - training_start_time) // 60} minutes")
-
-
-def create_train_step(actor_apply_fn, critic_apply_fn):
-    actor_loss_fn = partial(compute_actor_loss, apply_fn=actor_apply_fn)
-    actor_grad_fn = jax.value_and_grad(actor_loss_fn, allow_int=True)
-    
-    critic_loss_fn = partial(compute_v_loss, apply_fn=critic_apply_fn)
-    critic_grad_fn = jax.value_and_grad(critic_loss_fn)
-
-    @jax.jit
-    def train_step(actor_state, critic_state, obs, act, rew, adv):
-        _, actor_grads = actor_grad_fn(actor_state.params, obs, act, adv)
-        actor_state = actor_state.apply_gradients(grads=actor_grads)
-
-        def critic_update(i, state):
-            _, critic_grads = critic_grad_fn(state.params, obs, rew)
-            state = state.apply_gradients(grads=critic_grads)
-            return state
-
-        critic_state = jax.lax.fori_loop(
-            0, 80, critic_update, critic_state
-        )
-        return actor_state, critic_state 
-    
-    return train_step
 
 
 if __name__ == "__main__":
