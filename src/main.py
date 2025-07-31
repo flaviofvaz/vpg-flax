@@ -74,9 +74,9 @@ class Buffer:
 
 
 def compute_actor_loss(actor_params, observations: jax.Array, actions: jax.Array, advantage: jax.Array, apply_fn):
-    dist = apply_fn({"params": actor_params}, observations)
-    logp = dist.log_prob(actions)
-
+    mean, std = apply_fn({"params": actor_params}, observations)
+    logp = jax.scipy.stats.norm.logpdf(actions, loc=mean, scale=std)
+    logp = jnp.sum(logp, axis=-1)
     return (-logp * advantage).mean()
 
 
@@ -89,11 +89,13 @@ def create_get_action(actor_apply_fn, critic_apply_fn):
     @jax.jit
     def get_action(obs: jax.Array, actor_state: train_state.TrainState, critic_state: train_state.TrainState, key: jax.random.PRNGKey):
         # actor forward apass
-        dist = actor_apply_fn({"params": actor_state.params}, obs)
-        
-        # sample action according to distribution
+        mean, std = actor_apply_fn({"params": actor_state.params}, obs)
+
         key, subkey = jax.random.split(key)
-        action = dist.sample(seed=subkey)
+        z = jax.random.normal(subkey, shape=mean.shape)
+        
+        # sample action according to distribution using the reparemeterization trick
+        action = mean + std * z
 
         # critic forward pass
         v = critic_apply_fn({"params": critic_state.params}, obs)
@@ -127,7 +129,6 @@ def create_train_step(actor_apply_fn, critic_apply_fn):
     return train_step
 
 
-
 def collect_trajectories(buffer, env, actor_state, critic_state, num_steps, max_len, random_key, get_action):
     time_step = env.reset()
 
@@ -150,7 +151,6 @@ def collect_trajectories(buffer, env, actor_state, critic_state, num_steps, max_
         truncate = ep_len == max_len
         last_step = t == num_steps - 1
         if terminal or truncate or last_step:
-
             if (truncate or last_step) and not terminal:
                 # bootstrap v
                 obs = np.concatenate([time_step.observation["position"], time_step.observation["velocity"]])

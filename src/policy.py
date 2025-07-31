@@ -1,9 +1,5 @@
 from flax import linen as nn
-import jax
 import jax.numpy as jnp
-from distrax import MultivariateNormalDiag
-from typing import Any, Callable, Sequence
-
 
 class MeanNetwork(nn.Module):
     @nn.compact
@@ -19,13 +15,12 @@ class MeanNetwork(nn.Module):
 
 class GaussianPolicy(nn.Module):
     @nn.compact
-    def __call__(self, x: jax.Array):
+    def __call__(self, x):
         log_std = self.param("log_std", nn.initializers.zeros, (1))
         mean = MeanNetwork()(x)
         std = jnp.exp(log_std)
-        dist = MultivariateNormalDiag(loc=mean, scale_diag=std)
-
-        return dist
+    
+        return mean, std
 
 class CriticNet(nn.Module):
     @nn.compact
